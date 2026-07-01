@@ -1,1 +1,1 @@
-# Structured Products Analyzer
+# Structured Product Analyzer
