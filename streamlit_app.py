@@ -17,6 +17,13 @@ st.caption("Outil d'aide a la decision pour CGP. Aucune donnee client.")
 
 PRESET_KEYS = list(PRESET_TICKERS.keys())
 
+NATURES = ["conditional", "accrued", "guaranteed"]
+NATURE_LABEL = {
+    "conditional": "Phoenix (coupon conditionnel en cours de vie)",
+    "accrued": "Athena (coupon capitalise, verse a la sortie)",
+    "guaranteed": "Garanti",
+}
+
 # Palette institutionnelle
 GREEN = "#2E6356"; GOLD = "#977B3C"; RED = "#A83838"; INK = "#15191D"; GREY = "#9AA0A6"
 
@@ -52,11 +59,10 @@ def measure_selector(prefix: str):
     """
     Choix de la mesure de probabilite.
 
-    Le drift risque-neutre (r - q) est correct pour valoriser, mais les probabilites
-    qui en decoulent incorporent la prime de risque actions : elles sont pessimistes
-    par construction. Sur un autocall a 8 ans l'ecart avec la mesure reelle atteint
-    facilement 5 a 6 points de probabilite de perte. Presenter l'une pour l'autre a
-    un client, sans le dire, n'est pas defendable.
+    Le drift risque-neutre est correct pour valoriser, mais les probabilites qui
+    en decoulent incorporent la prime de risque actions : elles sont pessimistes
+    par construction. Sur un 8 ans, l'ecart avec la mesure reelle atteint
+    facilement plusieurs points de probabilite de perte.
     """
     init_state(f"{prefix}_measure", "Risque-neutre (valorisation)")
     m = st.radio("Mesure de probabilite",
@@ -67,8 +73,8 @@ def measure_selector(prefix: str):
         mu = st.number_input("Rendement attendu du sous-jacent (%/an)", step=0.5,
                              format="%.2f", key=f"{prefix}_mu",
                              help="Taux sans risque + prime de risque actions. "
-                                  "4 a 6 points au-dessus du taux sans risque est un ordre "
-                                  "de grandeur usuel pour un indice actions large.")
+                                  "4 a 6 points au-dessus du taux sans risque est un "
+                                  "ordre de grandeur usuel pour un indice actions large.")
         return float(mu) / 100.0
     return None
 
@@ -98,18 +104,26 @@ def product_form(prefix: str, defaults: dict):
     st.caption("Coupon")
     c7, c8 = st.columns(2)
     crate_annual = num5(c7, "Coupon annuel", f"{prefix}_cr", defaults["coupon"])
-    cnat = c8.selectbox("Nature", ["conditional", "guaranteed"],
-                        format_func=lambda x: {"conditional": "Conditionnel",
-                                               "guaranteed": "Garanti"}[x],
+    init_state(f"{prefix}_cnat", "conditional")
+    cnat = c8.selectbox("Nature", NATURES, format_func=lambda x: NATURE_LABEL[x],
                         key=f"{prefix}_cnat")
     step = FREQ_STEP[frequency]
     crate_period = crate_annual * step
-    st.caption(f"Soit {crate_period*100:.3f}% verse a chaque constatation "
-               f"({FREQ_LABEL[frequency].lower()}, {round(1/step)}/an).")
+
+    if cnat == "accrued":
+        n_per = max(int(round(float(maturity) / step)), 1)
+        st.caption(f"Athena : rien n'est verse en cours de vie. A la sortie, le porteur "
+                   f"recoit 100% + {crate_period*100:.3f}% par constatation ecoulee. "
+                   f"Gain maximal au terme : {(1 + crate_period*n_per)*100:.1f}%. "
+                   f"En cas de perte au terme, aucun coupon n'est verse.")
+    else:
+        st.caption(f"Soit {crate_period*100:.3f}% verse a chaque constatation "
+                   f"({FREQ_LABEL[frequency].lower()}, {round(1/step)}/an).")
+
     c9, c10 = st.columns(2)
     cbar = num5(c9, "Barr. coupon", f"{prefix}_cbar", 0.70, step=0.01,
-                disabled=(cnat == "guaranteed"))
-    cmem = c10.checkbox("Memoire", value=True, disabled=(cnat == "guaranteed"),
+                disabled=(cnat != "conditional"))
+    cmem = c10.checkbox("Memoire", value=True, disabled=(cnat != "conditional"),
                         key=f"{prefix}_cmem")
 
     st.caption("Rappel & protection")
@@ -231,7 +245,8 @@ with tab_one:
     n_sims = cns.select_slider("Trajectoires", options=[5000, 10000, 20000, 40000],
                                value=20000, key="single_ns")
     fix_seed = cseed.checkbox("Graine fixe", value=True, key="single_seed_on",
-                              help="Resultats reproductibles, necessaire pour tracer un devoir de conseil.")
+                              help="Resultats reproductibles, necessaire pour tracer "
+                                   "un devoir de conseil.")
     drift = measure_selector("single")
 
     prod, spec, r, spot, name = product_form("S", dict(title="Produit", vol=0.20, maturity=8.0,
@@ -296,7 +311,8 @@ with tab_one:
             show_fig(mc_figure(cal, res, prod, spot))
         st.info("Volatilite historique, plate, sans smile. Les barrieres profondes sont donc "
                 "sous-estimees : un put a 60% se traite en pratique a une vol implicite bien "
-                "superieure a la vol ATM. Outil CGP interne, ne remplace pas une valorisation emetteur.")
+                "superieure a la vol ATM. Outil CGP interne, ne remplace pas une valorisation "
+                "emetteur.")
 
 # ----- ONGLET 2 -----
 with tab_cmp:
@@ -418,8 +434,8 @@ with tab_corr:
                     f"Correlation {lvl}. Pour un worst-of, plus la correlation est faible, plus "
                     f"le coupon offert est eleve (le client vend de la correlation). "
                     f"R2 = {r2*100:.1f}% de la variance de {t2} expliquee lineairement par {t1}. "
-                    f"Rappel : la correlation glissante ci-dessous montre a quel point ce chiffre "
-                    f"unique est instable, et elle monte vers 1 dans les phases de stress.")
+                    f"La correlation glissante ci-dessous montre a quel point ce chiffre unique "
+                    f"est instable, et elle monte vers 1 dans les phases de stress.")
 
                 figr, (axS, axR2) = plt.subplots(1, 2, figsize=(13, 5))
                 axS.scatter(a * 100, b * 100, s=8, alpha=0.35, color=GREEN)
