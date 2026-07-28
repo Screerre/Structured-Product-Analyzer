@@ -5,28 +5,35 @@ from core.product import StructuredProduct
 
 class ProductEngine:
     """
-    Autocall single stock, vectorise. Probas date par date + actualisation des flux.
+    Autocall vectorise. Probas date par date + actualisation des flux.
 
     Le simulateur est injecte et doit exposer :
         .spot, .r, .simulate_paths(times, n_sims) -> ndarray (n_sims, len(times))
-    MarketSimulator et BasketSimulator respectent ce contrat, le moteur est donc
-    indifferent au fait que le sous-jacent soit un ticker unique ou un panier
-    reconstitue.
+    MarketSimulator et BasketSimulator respectent ce contrat.
 
-    LE DECREMENT N'EST PLUS TRAITE ICI. Il l'etait ainsi :
+    TROIS NATURES DE COUPON
+    -----------------------
+    "guaranteed"  Coupon verse a chaque constatation, sans condition.
 
-        ratio = ratio * ((1.0 - p.decrement) ** t_arr)[None, :]
+    "conditional" PHOENIX. Coupon verse a chaque constatation si le sous-jacent
+                  est au-dessus de la barriere coupon. Avec effet memoire, les
+                  coupons manques sont rattrapes a la premiere constatation
+                  au-dessus de la barriere. Le coupon est encaisse en cours de
+                  vie et reste acquis meme si le produit finit en perte.
 
-    Deux defauts. C'etait un decrement en POURCENTAGE alors que le marche francais
-    est majoritairement en POINTS fixes, ce qui n'a pas le meme profil de risque :
-    50 points coutent 5% a un indice a 1000 et 7,1% a un indice a 700, donc le
-    prelevement se durcit precisement dans les scenarios ou la barriere de capital
-    est menacee. Et surtout il s'ajoutait au dividende q deja retranche dans le
-    drift du GBM, alors que dans un indice decrement le prelevement synthetique
-    REMPLACE le dividende. Le drag etait donc compte deux fois.
+    "accrued"     ATHENA. Rien n'est verse en cours de vie. Le coupon est
+                  capitalise et n'est verse qu'a la SORTIE : rappel anticipe, ou
+                  terme si le sous-jacent est au-dessus de la barriere de capital.
+                  En cas de perte au terme, AUCUN coupon n'est verse.
 
-    Le decrement est desormais applique dans le simulateur, sur une grille fine
-    (il est path-dependent) et avec la bonne convention. Voir simulation/basket.py.
+                  Ne pas simuler un Athena avec un Phoenix a barriere quasi nulle :
+                  les trajectoires perdantes conserveraient les coupons encaisses
+                  en route, ce qui transforme le pire scenario en gain. Sur un
+                  8 ans a 11%, une trajectoire finissant a 40% ressortirait a 1,28
+                  au lieu de 0,40.
+
+    LE DECREMENT N'EST PLUS TRAITE ICI. Il est applique dans le simulateur, sur
+    une grille fine et en points (voir simulation/basket.py).
     """
 
     def __init__(self, product: StructuredProduct, simulator):
@@ -44,10 +51,11 @@ class ProductEngine:
         maturity = float(p.maturity_years)
         coup = p.coupon; auto = p.autocall; cap = p.capital
         first_call = auto.first_call_year if auto else 0.0
+        accrued = bool(coup) and getattr(coup, "nature", "") == "accrued"
 
         status = np.empty(n, dtype=object)
         payoff = np.zeros(n)         # flux nominaux (non actualises)
-        pv = np.zeros(n)             # flux ACTUALISES (present value)
+        pv = np.zeros(n)             # flux ACTUALISES
         call_time = np.full(n, maturity)
         coupons = np.zeros(n)
         alive = np.ones(n, dtype=bool)
@@ -58,19 +66,21 @@ class ProductEngine:
         prob_below_coupon = np.zeros(n_dates)
         prob_below_capital = np.zeros(n_dates)
         prob_alive_before = np.zeros(n_dates)
-        barrier_path = np.full(n_dates, np.nan)   # barriere de rappel effective par date
+        barrier_path = np.full(n_dates, np.nan)
 
         for k, ev in enumerate(calendar.events):
             t = ev.time_year
             w = ratio[:, k]
             disc = np.exp(-r * t)
+            n_periods = k + 1                       # constatations ecoulees
+            acc = coup.rate * n_periods if accrued else 0.0
 
             prob_alive_before[k] = alive.mean()
             if coup: prob_below_coupon[k] = float(np.mean(w < coup.barrier))
             if cap:  prob_below_capital[k] = float(np.mean(w < cap.barrier))
 
-            # COUPON
-            if coup:
+            # ---------------- COUPON en cours de vie ----------------
+            if coup and not accrued:
                 if coup.nature == "guaranteed":
                     coupons[alive] += coup.rate
                     pv[alive] += coup.rate * disc
@@ -85,20 +95,29 @@ class ProductEngine:
                     else:
                         coupons[hit] += coup.rate
                         pv[hit] += coup.rate * disc
+            # En mode "accrued" on ne verse rien ici : le coupon est capitalise
+            # et sera regle en une fois a la sortie, actualise a la bonne date.
 
-            # AUTOCALL
+            # ---------------- AUTOCALL ----------------
             if ev.is_autocall:
                 bar = max(auto.barrier - auto.step_down * (t - first_call), 0.0)
                 barrier_path[k] = bar
                 called = alive & (w >= bar)
                 prob_recall[k] = called.mean()
                 status[called] = "autocall"
-                payoff[called] = 1.0 + coupons[called]
-                pv[called] += 1.0 * disc
                 call_time[called] = t
+
+                if accrued:
+                    coupons[called] = acc
+                    payoff[called] = 1.0 + acc
+                    pv[called] += (1.0 + acc) * disc
+                else:
+                    payoff[called] = 1.0 + coupons[called]
+                    pv[called] += 1.0 * disc
+
                 alive[called] = False
 
-            # MATURITE
+            # ---------------- MATURITE ----------------
             if ev.is_maturity:
                 wT = ratio[:, k]; surv = alive
                 if cap:
@@ -106,10 +125,24 @@ class ProductEngine:
                     lost = surv & (wT < cap.barrier)
                 else:
                     protected = surv; lost = np.zeros(n, dtype=bool)
-                status[protected] = "maturity"; payoff[protected] = 1.0 + coupons[protected]
-                pv[protected] += 1.0 * disc
-                status[lost] = "loss"; payoff[lost] = wT[lost] + coupons[lost]
-                pv[lost] += wT[lost] * disc
+
+                status[protected] = "maturity"
+                status[lost] = "loss"
+
+                if accrued:
+                    coupons[protected] = acc
+                    payoff[protected] = 1.0 + acc
+                    pv[protected] += (1.0 + acc) * disc
+                    # Perte au terme : le coupon capitalise n'est jamais verse.
+                    coupons[lost] = 0.0
+                    payoff[lost] = wT[lost]
+                    pv[lost] += wT[lost] * disc
+                else:
+                    payoff[protected] = 1.0 + coupons[protected]
+                    pv[protected] += 1.0 * disc
+                    payoff[lost] = wT[lost] + coupons[lost]
+                    pv[lost] += wT[lost] * disc
+
                 alive[:] = False
 
         return {
